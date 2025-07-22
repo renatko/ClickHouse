@@ -64,6 +64,8 @@ public:
     static GinIndexPostingsListPtr deserialize(ReadBuffer & buffer);
 
 private:
+    static constexpr std::string FASTPFOR_CODEC_NAME = "simdfastpfor256";
+
     static constexpr size_t MIN_SIZE_FOR_ROARING_ENCODING = 16;
 
     static constexpr size_t ROARING_ENCODING_COMPRESSION_CARDINALITY_THRESHOLD = 5000;

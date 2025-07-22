@@ -2,6 +2,8 @@
 
 #include <Storages/MergeTree/GinIndexStore.h>
 #include <Columns/ColumnString.h>
+#include <Common/PODArray.h>
+#include <Common/ArenaAllocator.h>
 #include <Common/FST.h>
 #include <Compression/CompressionFactory.h>
 #include <Compression/ICompressionCodec.h>
@@ -16,6 +18,9 @@
 #include <vector>
 #include <unordered_map>
 #include <algorithm>
+
+#include <fastpfor.h>
+#include <codecfactory.h>
 
 namespace DB
 {
@@ -48,110 +53,69 @@ void GinIndexPostingsBuilder::add(UInt32 row_id)
 UInt64 GinIndexPostingsBuilder::serialize(WriteBuffer & buffer)
 {
     rowids.runOptimize();
-
     const UInt64 cardinality = rowids.cardinality();
 
-    if (cardinality < MIN_SIZE_FOR_ROARING_ENCODING)
+    PaddedPODArray<UInt32> deltas(cardinality);
+#if 1
+    UInt32 prev = 0;
+    for (size_t i = 0; const UInt32 rowid : rowids)
     {
-        std::vector<UInt32> values(cardinality);
-        rowids.toUint32Array(values.data());
-
-        UInt64 header = (cardinality << 1) | ARRAY_CONTAINER_MASK;
-        writeVarUInt(header, buffer);
-
-        UInt64 written_bytes = getLengthOfVarUInt(header);
-        for (const auto & value : values)
-        {
-            writeVarUInt(value, buffer);
-            written_bytes += getLengthOfVarUInt(value);
-        }
-
-        return written_bytes;
+        deltas[i] = rowid - prev;
+        prev = rowid;
+        ++i;
     }
-
-    const bool compress = cardinality >= ROARING_ENCODING_COMPRESSION_CARDINALITY_THRESHOLD;
-    const UInt64 uncompressed_size = rowids.getSizeInBytes();
-
-    std::vector<char> buf(uncompressed_size);
-    rowids.write(buf.data());
-
-    UInt64 header = uncompressed_size;
-    if (compress)
+#else
+    rowids.toUint32Array(deltas.data());
+    UInt32 prev = deltas[0];
+    UInt32 curr = 0;
+    for (size_t i = 1; i < deltas.size(); ++i)
     {
-        Memory<> memory;
-        const auto & codec = GinIndexCompressionFactory::zstdCodec();
-        memory.resize(codec->getCompressedReserveSize(static_cast<UInt32>(uncompressed_size)));
-        auto compressed_size = codec->compress(buf.data(), static_cast<UInt32>(uncompressed_size), memory.data());
-
-        header = (header << 2) | (ROARING_COMPRESSED_MASK << 1) | ROARING_CONTAINER_MASK;
-
-        writeVarUInt(header, buffer);
-        writeVarUInt(compressed_size, buffer);
-        buffer.write(memory.data(), compressed_size);
-
-        return getLengthOfVarUInt(header) + getLengthOfVarUInt(compressed_size) + compressed_size;
+        curr = deltas[i];
+        deltas[i] -= prev;
+        prev = curr;
     }
-    else
-    {
-        header = (header << 2) | (ROARING_UNCOMPRESSED_MASK << 1) | ROARING_CONTAINER_MASK;
+#endif
 
-        writeVarUInt(header, buffer);
-        buffer.write(buf.data(), uncompressed_size);
+    static FastPForLib::CODECFactory factory;
+    static FastPForLib::IntegerCODEC & codec = *factory.getFromName(FASTPFOR_CODEC_NAME);
 
-        return getLengthOfVarUInt(header) + uncompressed_size;
-    }
+    std::vector<UInt32> compressed(deltas.size() + 1024);
+    size_t compressed_size = compressed.size();
+    codec.encodeArray(deltas.data(), deltas.size(), compressed.data(), compressed_size);
+    chassert(compressed_size <= deltas.size());
+    compressed.resize(compressed_size);
+    compressed.shrink_to_fit();
+
+    size_t num_deltas = deltas.size();
+    writeVarUInt(num_deltas, buffer);
+    writeVarUInt(compressed_size, buffer);
+    buffer.write(reinterpret_cast<char *>(compressed.data()), compressed_size * sizeof(UInt32));
+
+    return getLengthOfVarUInt(num_deltas) + getLengthOfVarUInt(compressed_size) + (compressed_size * sizeof(UInt32));
 }
 
 GinIndexPostingsListPtr GinIndexPostingsBuilder::deserialize(ReadBuffer & buffer)
 {
-    /**
-     * Header value maps into following states:
-     * The lowest bit indicates if values are stored as an array or Roaring bitmap
-     * In case of array container, the rest of the bits is the number of entries in the array.
-     * In case of Roaring bitmap, the second lowest bit indicates if Roaring bitmap is compressed or uncompressed, the rest of the bits is the uncompressed size.
-     */
-    UInt64 header = 0;
-    readVarUInt(header, buffer);
+    size_t num_deltas = 0;
+    size_t compressed_size = 0;
+    readVarUInt(num_deltas, buffer);
+    readVarUInt(compressed_size, buffer);
 
-    if (header & ARRAY_CONTAINER_MASK) /// Array
-    {
-        UInt64 num_entries = (header >> 1);
-        std::vector<UInt32> values(num_entries);
-        for (size_t i = 0; i < num_entries; ++i)
-            readVarUInt(values[i], buffer);
+    std::vector<UInt32> compressed(compressed_size);
+    buffer.readStrict(reinterpret_cast<char *>(compressed.data()), compressed_size * sizeof(UInt32));
 
-        GinIndexPostingsListPtr postings_list = std::make_shared<GinIndexPostingsList>();
-        postings_list->addMany(values.size(), values.data());
-        return postings_list;
-    }
-    else /// Roaring
-    {
-        header >>= 1;
+    static FastPForLib::CODECFactory factory;
+    static FastPForLib::IntegerCODEC & codec = *factory.getFromName(FASTPFOR_CODEC_NAME);
 
-        const bool compressed = header & ROARING_COMPRESSED_MASK;
-        const UInt64 uncompressed_size = (header >> 1);
-        if (compressed)
-        {
-            size_t compressed_size = 0;
-            readVarUInt(compressed_size, buffer);
-            std::vector<char> buf(compressed_size);
-            buffer.readStrict(reinterpret_cast<char *>(buf.data()), compressed_size);
+    PaddedPODArray<UInt32> deltas(num_deltas);
+    codec.decodeArray(compressed.data(), compressed_size, deltas.data(), num_deltas);
 
-            Memory<> memory;
-            memory.resize(uncompressed_size);
-            const auto & codec = GinIndexCompressionFactory::zstdCodec();
-            codec->decompress(buf.data(), static_cast<UInt32>(compressed_size), memory.data());
+    for (size_t i = 1; i < num_deltas; ++i)
+        deltas[i] += deltas[i - 1];
 
-            return std::make_shared<GinIndexPostingsList>(GinIndexPostingsList::read(memory.data()));
-        }
-        else
-        {
-            /// Deserialize uncompressed roaring bitmap
-            std::vector<char> buf(uncompressed_size);
-            buffer.readStrict(buf.data(), uncompressed_size);
-            return std::make_shared<GinIndexPostingsList>(GinIndexPostingsList::read(buf.data()));
-        }
-    }
+    GinIndexPostingsListPtr postings_list = std::make_shared<GinIndexPostingsList>();
+    postings_list->addMany(deltas.size(), deltas.data());
+    return postings_list;
 }
 
 GinIndexStore::GinIndexStore(const String & name_, DataPartStoragePtr storage_)
